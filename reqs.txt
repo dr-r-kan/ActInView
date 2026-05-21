@@ -1,0 +1,7 @@
+inferactively-pymdp>=1.0.2
+jax>=0.4
+jaxlib>=0.4
+numpy>=1.26
+pandas>=2.1
+matplotlib>=3.8
+tqdm>=4.66
