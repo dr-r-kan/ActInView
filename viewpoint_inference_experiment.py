@@ -13,9 +13,11 @@ Other candidate families encode cost-only, prospect, refuge, stationarity,
 attainment, and combined mechanisms.
 
 Run:
-    python viewpoint_inference_experiment_fixed.py --test-mode
-    python viewpoint_inference_experiment_fixed.py --output-dir outputs_viewpoint_pymdp_study1
-    python viewpoint_inference_experiment_fixed.py --test-mode --no-progress
+    python viewpoint_inference_experiment.py --test-mode
+    python viewpoint_inference_experiment.py --output-dir outputs_viewpoint_pymdp_study1
+    python viewpoint_inference_experiment.py --test-mode --no-progress
+    python viewpoint_inference_experiment.py --output-dir outputs_viewpoint_pymdp_study1_array --num-shards 160 --shard-index 0
+    python viewpoint_inference_experiment.py --output-dir outputs_viewpoint_pymdp_study1_array --num-shards 160 --merge-shards
 
 Required packages:
     pip install inferactively-pymdp tqdm
@@ -65,6 +67,13 @@ ACTION_DELTAS = {
 }
 N_ACTIONS = len(ACTION_NAMES)
 NONE_SEEN = -1
+MODEL_RECOVERY_COLUMNS = [
+    "true_model",
+    "candidate_model",
+    "n_decisions",
+    "log_likelihood",
+    "mean_log_likelihood",
+]
 
 
 @dataclass(frozen=True)
@@ -94,6 +103,8 @@ class Config:
     action_temperature: float = 1.0
     min_policy_prior: float = 1e-8
     ppc_replications: int = 8
+    num_shards: int = 1
+    shard_index: int = 0
     test_mode: bool = False
     progress: bool = True
 
@@ -108,6 +119,14 @@ class Config:
     @property
     def json_dir(self) -> Path:
         return self.output_dir / "json"
+
+    @property
+    def shards_dir(self) -> Path:
+        return self.output_dir / "shards"
+
+    @property
+    def shard_tag(self) -> str:
+        return f"shard_{self.shard_index:04d}_of_{self.num_shards:04d}"
 
 
 @dataclass(frozen=True)
@@ -208,6 +227,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-trials-per-agent", type=int, default=8)
     parser.add_argument("--horizon", type=int, default=18)
     parser.add_argument("--policy-len", type=int, default=2)
+    parser.add_argument("--num-shards", type=int, default=1, help="Total number of array shards for trial-level splitting.")
+    parser.add_argument("--shard-index", type=int, default=0, help="Zero-based shard index for this task.")
+    parser.add_argument("--merge-shards", action="store_true", help="Merge previously completed shard outputs and write final analyses.")
     parser.add_argument("--test-mode", action="store_true", help="Use a small fast run for debugging.")
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars and ETA display.")
     return parser.parse_args()
@@ -226,6 +248,8 @@ def make_config(args: argparse.Namespace) -> Config:
             horizon=min(args.horizon, 5),
             policy_len=min(args.policy_len, 1),
             ppc_replications=1,
+            num_shards=args.num_shards,
+            shard_index=args.shard_index,
             test_mode=True,
             progress=progress,
         )
@@ -238,14 +262,25 @@ def make_config(args: argparse.Namespace) -> Config:
         n_trials_per_agent=args.n_trials_per_agent,
         horizon=args.horizon,
         policy_len=args.policy_len,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
         test_mode=False,
         progress=progress,
     )
 
 
 def ensure_dirs(cfg: Config) -> None:
-    for d in [cfg.output_dir, cfg.tables_dir, cfg.figures_dir, cfg.json_dir]:
+    for d in [cfg.output_dir, cfg.tables_dir, cfg.figures_dir, cfg.json_dir, cfg.shards_dir]:
         d.mkdir(parents=True, exist_ok=True)
+
+
+def validate_sharding(cfg: Config) -> None:
+    if cfg.num_shards < 1:
+        raise RuntimeError(f"--num-shards must be at least 1, got {cfg.num_shards}.")
+    if cfg.shard_index < 0 or cfg.shard_index >= cfg.num_shards:
+        raise RuntimeError(
+            f"--shard-index must be in [0, {cfg.num_shards - 1}], got {cfg.shard_index}."
+        )
 
 
 class NullProgress:
@@ -647,6 +682,23 @@ def generate_world_bank(cfg: Config) -> list[GridWorld]:
             worlds.append(build_grid_world(cfg, family, level, w + 1, rng))
             pbar.update(1)
     return worlds
+
+
+def build_trial_jobs(worlds: list[GridWorld], models: list[ModelSpec], cfg: Config) -> list[tuple[GridWorld, ModelSpec, int, int]]:
+    jobs: list[tuple[GridWorld, ModelSpec, int, int]] = []
+    for world in worlds:
+        for model in models:
+            for agent_id in range(cfg.n_agents):
+                for trial_id in range(cfg.n_trials_per_agent):
+                    jobs.append((world, model, agent_id, trial_id))
+    return jobs
+
+
+def select_trial_jobs_for_shard(
+    jobs: list[tuple[GridWorld, ModelSpec, int, int]],
+    cfg: Config,
+) -> list[tuple[GridWorld, ModelSpec, int, int]]:
+    return jobs[cfg.shard_index::cfg.num_shards]
 
 
 def make_pymdp_model(world: GridWorld, model: ModelSpec, D_location: np.ndarray, D_food: np.ndarray, policy_len: int = 1) -> tuple[Any, PymdpModel]:
@@ -1178,12 +1230,20 @@ def replay_log_likelihood(
     return float(ll)
 
 
-def run_model_recovery(decision_df: pd.DataFrame, worlds: list[GridWorld], models: list[ModelSpec], cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def compute_model_recovery_loglik(
+    decision_df: pd.DataFrame,
+    worlds: list[GridWorld],
+    models: list[ModelSpec],
+    cfg: Config,
+    desc: str = "Model recovery",
+) -> pd.DataFrame:
+    if decision_df.empty:
+        return pd.DataFrame(columns=MODEL_RECOVERY_COLUMNS)
     world_map = {w.id: w for w in worlds}
     true_models = sorted(decision_df["generator_model"].unique().tolist())
     rows = []
     total_fits = len(true_models) * len(models)
-    with progress_bar(total_fits, "Model recovery", "fit", cfg) as pbar:
+    with progress_bar(total_fits, desc, "fit", cfg) as pbar:
         for true_name in true_models:
             D = decision_df[decision_df["generator_model"] == true_name].copy()
             for candidate in models:
@@ -1199,7 +1259,32 @@ def run_model_recovery(decision_df: pd.DataFrame, worlds: list[GridWorld], model
                     }
                 )
                 pbar.update(1)
-    loglik = pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=MODEL_RECOVERY_COLUMNS)
+
+
+def aggregate_model_recovery_loglik(loglik: pd.DataFrame) -> pd.DataFrame:
+    if loglik.empty:
+        return pd.DataFrame(columns=MODEL_RECOVERY_COLUMNS)
+    grouped = (
+        loglik.groupby(["true_model", "candidate_model"], as_index=False)[["n_decisions", "log_likelihood"]]
+        .sum()
+    )
+    grouped["mean_log_likelihood"] = grouped["log_likelihood"] / grouped["n_decisions"].clip(lower=1)
+    return grouped[MODEL_RECOVERY_COLUMNS]
+
+
+def summarise_model_recovery(loglik: pd.DataFrame, models: list[ModelSpec]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if loglik.empty:
+        ident = pd.DataFrame(columns=[
+            "true_model",
+            "best_recovered_model",
+            "loglik_margin",
+            "n_decisions",
+            "recovered_correctly",
+        ])
+        confusion = pd.DataFrame(columns=["true_model"] + [m.name for m in models])
+        return ident, confusion
+
     best_rows = []
     for true_name, sub in loglik.groupby("true_model"):
         sub = sub.sort_values("log_likelihood", ascending=False).reset_index(drop=True)
@@ -1219,6 +1304,12 @@ def run_model_recovery(decision_df: pd.DataFrame, worlds: list[GridWorld], model
         if m not in confusion.columns:
             confusion[m] = 0
     confusion = confusion[[m.name for m in models]].reset_index()
+    return ident, confusion
+
+
+def run_model_recovery(decision_df: pd.DataFrame, worlds: list[GridWorld], models: list[ModelSpec], cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    loglik = aggregate_model_recovery_loglik(compute_model_recovery_loglik(decision_df, worlds, models, cfg))
+    ident, confusion = summarise_model_recovery(loglik, models)
     return loglik, ident, confusion
 
 
@@ -1300,40 +1391,76 @@ def posterior_predictive_checks(
     return pd.DataFrame(rows)
 
 
-def run_experiment(cfg: Config) -> dict[str, Any]:
+def shard_output_path(cfg: Config, stem: str, suffix: str = ".csv") -> Path:
+    return cfg.shards_dir / f"{stem}_{cfg.shard_tag}{suffix}"
+
+
+def write_shard_outputs(
+    trial_df: pd.DataFrame,
+    decision_df: pd.DataFrame,
+    loglik_df: pd.DataFrame,
+    cfg: Config,
+    total_trials: int,
+    assigned_trials: int,
+    elapsed: float,
+) -> None:
+    shard_files = {
+        "trials": shard_output_path(cfg, "trials"),
+        "decisions": shard_output_path(cfg, "decisions"),
+        "model_recovery_loglik": shard_output_path(cfg, "model_recovery_loglik"),
+    }
+    trial_df.to_csv(shard_files["trials"], index=False)
+    decision_df.to_csv(shard_files["decisions"], index=False)
+    loglik_df.to_csv(shard_files["model_recovery_loglik"], index=False)
+
+    manifest = {
+        "project": "viewpoint_active_inference_pymdp_study1",
+        "seed": cfg.seed,
+        "test_mode": cfg.test_mode,
+        "num_shards": cfg.num_shards,
+        "shard_index": cfg.shard_index,
+        "shard_tag": cfg.shard_tag,
+        "assigned_trials": assigned_trials,
+        "total_trials": total_trials,
+        "elapsed_seconds": float(elapsed),
+        "config": {k: str(v) if isinstance(v, Path) else v for k, v in asdict(cfg).items()},
+        "outputs": {k: str(v) for k, v in shard_files.items()},
+    }
+    shard_output_path(cfg, "manifest", suffix=".json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def load_required_shard_table(cfg: Config, stem: str) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    missing: list[str] = []
+    for shard_index in range(cfg.num_shards):
+        shard_tag = f"shard_{shard_index:04d}_of_{cfg.num_shards:04d}"
+        path = cfg.shards_dir / f"{stem}_{shard_tag}.csv"
+        if not path.exists():
+            missing.append(str(path))
+            continue
+        frames.append(pd.read_csv(path))
+    if missing:
+        preview = "\n".join(missing[:8])
+        remainder = len(missing) - min(len(missing), 8)
+        suffix = "" if remainder <= 0 else f"\n... plus {remainder} more missing shard files."
+        raise RuntimeError(f"Missing shard outputs for merge:\n{preview}{suffix}")
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def merge_shard_outputs(cfg: Config) -> dict[str, Any]:
+    validate_sharding(cfg)
     ensure_dirs(cfg)
     started = time.perf_counter()
-    print(f"Started pymdp Study 1 at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    random.seed(cfg.seed)
-    rng = np.random.default_rng(cfg.seed)
+    print(f"Started shard merge at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    trial_df = load_required_shard_table(cfg, "trials")
+    decision_df = load_required_shard_table(cfg, "decisions")
+    shard_loglik = load_required_shard_table(cfg, "model_recovery_loglik")
+
     models = specify_candidate_models()
     worlds = generate_world_bank(cfg)
-
-    total_trials = len(worlds) * len(models) * cfg.n_agents * cfg.n_trials_per_agent
-    estimated_decisions = total_trials * cfg.horizon
-    recovery_fits = len(models) * len(models)
-    print(
-        "Planned work: "
-        f"{len(worlds)} worlds, {len(models)} models, {total_trials} trials, "
-        f"~{estimated_decisions} decisions, {recovery_fits} model-recovery fits. "
-        "Progress bars report elapsed time and ETA."
-    )
-
-    trial_rows: list[dict[str, Any]] = []
-    decision_rows: list[dict[str, Any]] = []
-    with progress_bar(total_trials, "Simulating trials", "trial", cfg) as pbar:
-        for world in worlds:
-            for model in models:
-                for agent_id in range(cfg.n_agents):
-                    for trial in range(cfg.n_trials_per_agent):
-                        pbar.set_postfix_str(f"world={world.id}, model={model.name}")
-                        sim = simulate_trial(world, model, cfg, rng, agent_id=agent_id, trial_id=trial, true_model_name=model.name)
-                        trial_rows.append(sim.trial_row)
-                        decision_rows.extend(sim.decision_rows)
-                        pbar.update(1)
-
-    trial_df = pd.DataFrame(trial_rows)
-    decision_df = pd.DataFrame(decision_rows)
     world_df = pd.DataFrame(world_summary_rows(worlds))
     model_df = pd.DataFrame([
         {"model": m.name, "weights": json.dumps(m.weights), "description": m.description, "gamma": m.gamma}
@@ -1342,7 +1469,105 @@ def run_experiment(cfg: Config) -> dict[str, Any]:
     family_df = pd.DataFrame([asdict(f) for f in define_world_families()])
 
     primary_summary, primary_contrasts = primary_analysis(trial_df)
-    loglik, ident, confusion = run_model_recovery(decision_df, worlds, models, cfg)
+    loglik = aggregate_model_recovery_loglik(shard_loglik)
+    ident, confusion = summarise_model_recovery(loglik, models)
+    ppc = posterior_predictive_checks(trial_df, ident, worlds, models, cfg)
+
+    outputs = {
+        "trials": trial_df,
+        "decisions": decision_df,
+        "worlds": world_df,
+        "models": model_df,
+        "families": family_df,
+        "primary_summary": primary_summary,
+        "primary_contrasts": primary_contrasts,
+        "model_recovery_loglik": loglik,
+        "model_recovery_identifiability": ident,
+        "model_recovery_confusion": confusion,
+        "posterior_predictive_checks": ppc,
+        "world_objects": worlds,
+    }
+    write_outputs(outputs, cfg)
+    elapsed = time.perf_counter() - started
+    print(f"Finished shard merge at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} after {format_duration(elapsed)}.")
+    return outputs
+
+
+def run_experiment(cfg: Config) -> dict[str, Any]:
+    validate_sharding(cfg)
+    ensure_dirs(cfg)
+    started = time.perf_counter()
+    print(f"Started pymdp Study 1 at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    random.seed(cfg.seed)
+    rng = np.random.default_rng(cfg.seed)
+    models = specify_candidate_models()
+    worlds = generate_world_bank(cfg)
+
+    all_jobs = build_trial_jobs(worlds, models, cfg)
+    shard_jobs = select_trial_jobs_for_shard(all_jobs, cfg)
+    total_trials = len(all_jobs)
+    assigned_trials = len(shard_jobs)
+    if assigned_trials == 0:
+        raise RuntimeError(
+            f"Shard {cfg.shard_tag} has no assigned trials. Reduce --num-shards to at most {total_trials}."
+        )
+    estimated_decisions = assigned_trials * cfg.horizon
+    recovery_fits = len(models) * len(models)
+    print(
+        "Planned work: "
+        f"{len(worlds)} worlds, {len(models)} models, {total_trials} trials, "
+        f"{cfg.num_shards} shard(s), {recovery_fits} model-recovery fits. "
+        "Progress bars report elapsed time and ETA."
+    )
+    if cfg.num_shards > 1:
+        print(
+            f"Running {cfg.shard_tag}: {assigned_trials} assigned trials, "
+            f"~{estimated_decisions} local decisions."
+        )
+
+    trial_rows: list[dict[str, Any]] = []
+    decision_rows: list[dict[str, Any]] = []
+    with progress_bar(assigned_trials, "Simulating trials", "trial", cfg) as pbar:
+        for world, model, agent_id, trial_id in shard_jobs:
+            pbar.set_postfix_str(f"world={world.id}, model={model.name}")
+            sim = simulate_trial(world, model, cfg, rng, agent_id=agent_id, trial_id=trial_id, true_model_name=model.name)
+            trial_rows.append(sim.trial_row)
+            decision_rows.extend(sim.decision_rows)
+            pbar.update(1)
+
+    trial_df = pd.DataFrame(trial_rows)
+    decision_df = pd.DataFrame(decision_rows)
+    loglik = compute_model_recovery_loglik(
+        decision_df,
+        worlds,
+        models,
+        cfg,
+        desc="Shard model recovery" if cfg.num_shards > 1 else "Model recovery",
+    )
+
+    if cfg.num_shards > 1:
+        elapsed = time.perf_counter() - started
+        write_shard_outputs(trial_df, decision_df, loglik, cfg, total_trials=total_trials, assigned_trials=assigned_trials, elapsed=elapsed)
+        print(
+            f"Finished {cfg.shard_tag} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+            f"after {format_duration(elapsed)}."
+        )
+        return {
+            "trials": trial_df,
+            "decisions": decision_df,
+            "model_recovery_loglik": loglik,
+        }
+
+    world_df = pd.DataFrame(world_summary_rows(worlds))
+    model_df = pd.DataFrame([
+        {"model": m.name, "weights": json.dumps(m.weights), "description": m.description, "gamma": m.gamma}
+        for m in models
+    ])
+    family_df = pd.DataFrame([asdict(f) for f in define_world_families()])
+
+    primary_summary, primary_contrasts = primary_analysis(trial_df)
+    loglik = aggregate_model_recovery_loglik(loglik)
+    ident, confusion = summarise_model_recovery(loglik, models)
     ppc = posterior_predictive_checks(trial_df, ident, worlds, models, cfg)
 
     outputs = {
@@ -1484,11 +1709,19 @@ def main() -> int:
     args = parse_args()
     cfg = make_config(args)
     try:
-        run_experiment(cfg)
+        if args.merge_shards:
+            merge_shard_outputs(cfg)
+        else:
+            run_experiment(cfg)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    print(f"Completed pymdp Study 1 simulation. Outputs written to: {cfg.output_dir}")
+    if args.merge_shards:
+        print(f"Completed shard merge. Outputs written to: {cfg.output_dir}")
+    elif cfg.num_shards > 1:
+        print(f"Completed {cfg.shard_tag}. Partial outputs written to: {cfg.shards_dir}")
+    else:
+        print(f"Completed pymdp Study 1 simulation. Outputs written to: {cfg.output_dir}")
     return 0
 
 
