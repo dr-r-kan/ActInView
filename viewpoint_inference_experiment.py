@@ -37,6 +37,7 @@ import math
 import random
 import sys
 import time
+import traceback
 import warnings
 from datetime import datetime
 from dataclasses import asdict, dataclass
@@ -1705,6 +1706,27 @@ def save_figure(fig: plt.Figure, out_base: Path) -> None:
     plt.close(fig)
 
 
+def write_error_report(exc: BaseException, cfg: Config, label: str) -> Path | None:
+    try:
+        cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        return None
+
+    report_path = cfg.output_dir / f"{label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    lines = [
+        f"time={datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"label={label}",
+        f"exception_type={type(exc).__name__}",
+        f"exception_message={exc}",
+        f"output_dir={cfg.output_dir}",
+        "",
+        "Traceback:",
+        traceback.format_exc().rstrip(),
+    ]
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report_path
+
+
 def main() -> int:
     args = parse_args()
     cfg = make_config(args)
@@ -1714,8 +1736,17 @@ def main() -> int:
         else:
             run_experiment(cfg)
     except RuntimeError as exc:
+        report_path = write_error_report(exc, cfg, "runtime_error")
         print(str(exc), file=sys.stderr)
+        if report_path is not None:
+            print(f"Error report written to: {report_path}", file=sys.stderr)
         return 2
+    except Exception as exc:  # noqa: BLE001
+        report_path = write_error_report(exc, cfg, "unhandled_exception")
+        traceback.print_exc()
+        if report_path is not None:
+            print(f"Error report written to: {report_path}", file=sys.stderr)
+        return 1
     if args.merge_shards:
         print(f"Completed shard merge. Outputs written to: {cfg.output_dir}")
     elif cfg.num_shards > 1:
